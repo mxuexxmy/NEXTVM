@@ -1,7 +1,9 @@
 package com.nextvm.core.binder
 
 import android.content.Context
+import android.content.Intent
 import com.nextvm.core.binder.proxy.ActivityManagerProxy
+import com.nextvm.core.binder.proxy.ActivityTaskManagerProxy
 import com.nextvm.core.binder.proxy.PackageManagerProxy
 import com.nextvm.core.common.AndroidCompat
 import com.nextvm.core.common.findField
@@ -15,6 +17,7 @@ import java.lang.reflect.Proxy
  *
  * Based on Android 16 frameworks/base analysis:
  * - ActivityManager.IActivityManagerSingleton (Singleton<IActivityManager>)
+ * - ActivityTaskManager.IActivityTaskManagerSingleton (Singleton<IActivityTaskManager>)
  * - ActivityThread.sPackageManager (static IPackageManager field)
  *
  * These proxies intercept system service calls from guest apps and
@@ -27,6 +30,7 @@ class BinderProxyManager(private val context: Context) {
     }
 
     private var amProxy: ActivityManagerProxy? = null
+    private var atmProxy: ActivityTaskManagerProxy? = null
     private var pmProxy: PackageManagerProxy? = null
 
     // Virtual app registry (package name -> VirtualApp)
@@ -40,6 +44,8 @@ class BinderProxyManager(private val context: Context) {
         Timber.tag(TAG).i("Installing Binder proxies...")
 
         installActivityManagerProxy()
+        // ATM after AM — startActivity Intent rewrite is shared via amProxy.
+        installActivityTaskManagerProxy()
         installPackageManagerProxy()
 
         Timber.tag(TAG).i("All Binder proxies installed")
@@ -144,6 +150,81 @@ class BinderProxyManager(private val context: Context) {
         }
     }
 
+    // === IActivityTaskManager Proxy ===
+
+    /**
+     * Install the IActivityTaskManager proxy.
+     *
+     * On Android 10+, [android.app.Activity.startActivity] and
+     * [android.app.Instrumentation.execStartActivity] call
+     * IActivityTaskManager.startActivity — not IActivityManager.
+     * Without this proxy, guest Intents keep the guest ComponentName and the
+     * real host ActivityManager resolves them to the host-installed app (if any),
+     * causing SecurityException for non-exported activities.
+     *
+     * Hook point (AOSP): ActivityTaskManager.IActivityTaskManagerSingleton
+     */
+    private fun installActivityTaskManagerProxy() {
+        val am = amProxy
+        if (am == null) {
+            Timber.tag(TAG).w("Skipping IActivityTaskManager proxy — IActivityManager not ready")
+            return
+        }
+        try {
+            val atmClass = Class.forName("android.app.ActivityTaskManager")
+            val singletonField = atmClass.getDeclaredField("IActivityTaskManagerSingleton")
+            singletonField.isAccessible = true
+            val singleton = singletonField.get(null)
+                ?: throw IllegalStateException("IActivityTaskManagerSingleton is null")
+
+            val singletonClass = Class.forName("android.util.Singleton")
+            val instanceField = singletonClass.getDeclaredField("mInstance")
+            instanceField.isAccessible = true
+
+            val getMethod = singletonClass.getDeclaredMethod("get")
+            getMethod.isAccessible = true
+            val originalAtm = getMethod.invoke(singleton)
+                ?: throw IllegalStateException("IActivityTaskManager original instance is null")
+
+            atmProxy = ActivityTaskManagerProxy(originalAtm, am)
+
+            val iatmClass = Class.forName("android.app.IActivityTaskManager")
+            val proxy = Proxy.newProxyInstance(
+                iatmClass.classLoader,
+                arrayOf(iatmClass),
+                atmProxy!!
+            )
+
+            instanceField.set(singleton, proxy)
+
+            // Also refresh ServiceManager cache if activity_task was already fetched.
+            try {
+                val smClass = Class.forName("android.os.ServiceManager")
+                val cacheField = smClass.getDeclaredField("sCache")
+                cacheField.isAccessible = true
+                @Suppress("UNCHECKED_CAST")
+                val cache = cacheField.get(null) as? MutableMap<String, Any?>
+                if (cache != null && cache.containsKey("activity_task")) {
+                    // Keep raw Binder in ServiceManager; our Singleton mInstance is what
+                    // ActivityTaskManager.getService() returns after init. No-op here —
+                    // documented for awareness if future Android caches the stub interface.
+                    Timber.tag(TAG).d("ServiceManager sCache has activity_task (Singleton override is authoritative)")
+                }
+            } catch (e: Exception) {
+                Timber.tag(TAG).d("ServiceManager activity_task cache check skipped: ${e.message}")
+            }
+
+            Timber.tag(TAG).i("IActivityTaskManager proxy installed")
+        } catch (e: ClassNotFoundException) {
+            // Pre-Q devices may lack ActivityTaskManager — AM path is enough.
+            Timber.tag(TAG).d("IActivityTaskManager not present on this API: ${e.message}")
+        } catch (e: NoSuchFieldException) {
+            Timber.tag(TAG).w(e, "IActivityTaskManagerSingleton field missing — ATM startActivity not hooked")
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Failed to install IActivityTaskManager proxy")
+        }
+    }
+
     // === IPackageManager Proxy ===
 
     /**
@@ -199,5 +280,15 @@ class BinderProxyManager(private val context: Context) {
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "Failed to install IPackageManager proxy")
         }
+    }
+
+    /**
+     * Rewrite a guest startActivity Intent onto a host stub activity.
+     * Used by [com.nextvm.core.virtualization.engine.NextVmInstrumentation]
+     * because Activity.startActivity goes through IActivityTaskManager on modern Android,
+     * bypassing the IActivityManager Binder proxy.
+     */
+    fun rewriteOutgoingStartActivityIntent(intent: Intent): Boolean {
+        return amProxy?.rewriteOutgoingStartActivityIntent(intent) ?: false
     }
 }

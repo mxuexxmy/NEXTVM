@@ -524,92 +524,101 @@ class VirtualEngine @Inject constructor(
                 else -> "standard"
             }
 
-            // 3. Resolve stub class based on launch mode
+            // 3. Free previously reserved stubs for this slot so relaunch works.
+            // Stubs were historically leaked on failed/repeated launches and on stop.
+            stubRegistry.releaseAllStubsForSlot(app.processSlot)
+
+            // 4. Resolve stub class based on launch mode
             val stubClass = stubRegistry.resolveStub(
                 slot = app.processSlot,
                 launchMode = launchMode
             ) ?: return VmResult.Error("No available stub for process slot ${app.processSlot}")
 
-            // 4. Build the swapped intent
-            val intent = Intent().apply {
-                setClassName(context.packageName, stubClass)
-                putExtra(VirtualIntentExtras.TARGET_PACKAGE, app.packageName)
-                putExtra(VirtualIntentExtras.TARGET_ACTIVITY, mainActivity)
-                putExtra(VirtualIntentExtras.INSTANCE_ID, app.instanceId)
-                putExtra(VirtualIntentExtras.APK_PATH, app.apkPath)
-                putExtra(VirtualIntentExtras.PROCESS_SLOT, app.processSlot)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-
-            // 5. Create ClassLoader for guest app (if not cached)
-            if (!classLoaders.containsKey(instanceId)) {
-                val classLoader = VirtualClassLoader.createClassLoader(
-                    apkPath = app.apkPath,
-                    instanceId = instanceId,
-                    parentDir = virtualRoot,
-                    prebuiltLibrarySearchPath = app.librarySearchPath.ifEmpty { null },
-                    splitApkPaths = app.splitApkPaths
-                )
-                classLoaders[instanceId] = classLoader
-                GuestClassLoaderRegistry.register(app.packageName, instanceId, classLoader)
-            }
-
-            // 6. Register process start in VAMS (real service)
-            serviceManager.activityManager.startProcess(
-                packageName = app.packageName,
-                instanceId = app.instanceId,
-                processSlot = app.processSlot
-            )
-
-            // 7. Start activity in VAMS
-            serviceManager.activityManager.startActivity(
-                packageName = app.packageName,
-                activityName = mainActivity,
-                instanceId = app.instanceId,
-                stubClassName = stubClass,
-                launchMode = launchModeInt
-            )
-
-            // 8. Register in running apps
-            runningApps[instanceId] = app.processSlot
-
-            // 8.3: Activate external storage hooks for this instance.
-            // This redirects Environment.getExternalStorageDirectory() and
-            // file I/O paths (/sdcard/, /storage/emulated/0/) to the sandbox.
-            val sdcardDir = sandboxManager.getExternalStorageDir(instanceId)
-            virtualEnvironmentHook.activateForInstance(instanceId, app.packageName)
-            nativeHookBridge.setupExternalStorageRedirections(instanceId, sdcardDir.absolutePath)
-
-            // 8.5: Install any deferred service proxies (e.g., NotificationManager)
-            systemServiceProxyManager.installDeferredProxies()
-
-            // 9. Mark as launched in VPMS
-            serviceManager.packageManager.markAsLaunched(app.packageName)
-
-            // 10. Update app state
-            updateAppState(instanceId) { it.copy(isRunning = true, lastLaunchedAt = System.currentTimeMillis()) }
-
-            // 10.5: Drain any FCM messages that arrived while the app was offline.
-            // These are queued by NextVmFcmService when the target instance wasn't running.
             try {
-                val fcmProxy = serviceManager.gmsManager.fcmProxy
-                val pending = fcmProxy.drainPendingMessages(instanceId)
-                if (pending.isNotEmpty()) {
-                    Timber.tag(TAG).d("Draining ${pending.size} queued FCM messages for $instanceId")
-                    pending.forEach { message ->
-                        val deliveryIntent = fcmProxy.buildDeliveryIntent(instanceId, message)
-                        deliverFcmToInstance(instanceId, deliveryIntent)
-                    }
+                // 5. Build the swapped intent
+                val intent = Intent().apply {
+                    setClassName(context.packageName, stubClass)
+                    putExtra(VirtualIntentExtras.TARGET_PACKAGE, app.packageName)
+                    putExtra(VirtualIntentExtras.TARGET_ACTIVITY, mainActivity)
+                    putExtra(VirtualIntentExtras.INSTANCE_ID, app.instanceId)
+                    putExtra(VirtualIntentExtras.APK_PATH, app.apkPath)
+                    putExtra(VirtualIntentExtras.PROCESS_SLOT, app.processSlot)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
+
+                // 6. Create ClassLoader for guest app (if not cached)
+                if (!classLoaders.containsKey(instanceId)) {
+                    val classLoader = VirtualClassLoader.createClassLoader(
+                        apkPath = app.apkPath,
+                        instanceId = instanceId,
+                        parentDir = virtualRoot,
+                        prebuiltLibrarySearchPath = app.librarySearchPath.ifEmpty { null },
+                        splitApkPaths = app.splitApkPaths
+                    )
+                    classLoaders[instanceId] = classLoader
+                    GuestClassLoaderRegistry.register(app.packageName, instanceId, classLoader)
+                }
+
+                // 7. Register process start in VAMS (real service)
+                serviceManager.activityManager.startProcess(
+                    packageName = app.packageName,
+                    instanceId = app.instanceId,
+                    processSlot = app.processSlot
+                )
+
+                // 8. Start activity in VAMS
+                serviceManager.activityManager.startActivity(
+                    packageName = app.packageName,
+                    activityName = mainActivity,
+                    instanceId = app.instanceId,
+                    stubClassName = stubClass,
+                    launchMode = launchModeInt
+                )
+
+                // 9. Register in running apps
+                runningApps[instanceId] = app.processSlot
+
+                // 9.3: Activate external storage hooks for this instance.
+                // This redirects Environment.getExternalStorageDirectory() and
+                // file I/O paths (/sdcard/, /storage/emulated/0/) to the sandbox.
+                val sdcardDir = sandboxManager.getExternalStorageDir(instanceId)
+                virtualEnvironmentHook.activateForInstance(instanceId, app.packageName)
+                nativeHookBridge.setupExternalStorageRedirections(instanceId, sdcardDir.absolutePath)
+
+                // 9.5: Install any deferred service proxies (e.g., NotificationManager)
+                systemServiceProxyManager.installDeferredProxies()
+
+                // 10. Mark as launched in VPMS
+                serviceManager.packageManager.markAsLaunched(app.packageName)
+
+                // 11. Update app state
+                updateAppState(instanceId) { it.copy(isRunning = true, lastLaunchedAt = System.currentTimeMillis()) }
+
+                // 11.5: Drain any FCM messages that arrived while the app was offline.
+                // These are queued by NextVmFcmService when the target instance wasn't running.
+                try {
+                    val fcmProxy = serviceManager.gmsManager.fcmProxy
+                    val pending = fcmProxy.drainPendingMessages(instanceId)
+                    if (pending.isNotEmpty()) {
+                        Timber.tag(TAG).d("Draining ${pending.size} queued FCM messages for $instanceId")
+                        pending.forEach { message ->
+                            val deliveryIntent = fcmProxy.buildDeliveryIntent(instanceId, message)
+                            deliverFcmToInstance(instanceId, deliveryIntent)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Timber.tag(TAG).w("FCM drain failed for $instanceId: ${e.message}")
+                }
+
+                // 12. Launch via real system (it sees a valid stub component)
+                context.startActivity(intent)
+
+                Timber.tag(TAG).i("Launched: ${app.appName} via stub $stubClass (launchMode=$launchMode)")
+                return VmResult.Success(Unit)
             } catch (e: Exception) {
-                Timber.tag(TAG).w("FCM drain failed for $instanceId: ${e.message}")
+                stubRegistry.releaseStub(stubClass)
+                throw e
             }
-
-            // 11. Launch via real system (it sees a valid stub component)
-            context.startActivity(intent)
-
-            Timber.tag(TAG).i("Launched: ${app.appName} via stub $stubClass (launchMode=$launchMode)")
-            return VmResult.Success(Unit)
 
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "Failed to launch: ${app.appName}")
@@ -626,6 +635,7 @@ class VirtualEngine @Inject constructor(
             // Kill process in VAMS (takes instanceId, not slot)
             serviceManager.activityManager.killProcess(instanceId)
             processManager.releaseSlot(slot)
+            stubRegistry.releaseAllStubsForSlot(slot)
             classLoaders.remove(instanceId)
             val pkg = findApp(instanceId)?.packageName ?: instanceId.substringBefore('_')
             GuestClassLoaderRegistry.unregister(pkg, instanceId)
@@ -644,6 +654,11 @@ class VirtualEngine @Inject constructor(
 
             updateAppState(instanceId) { it.copy(isRunning = false) }
             Timber.tag(TAG).i("Stopped app: $instanceId")
+        } else {
+            // App may not be in runningApps (crashed / leaked) but still hold stubs
+            findApp(instanceId)?.processSlot?.takeIf { it >= 0 }?.let { persistedSlot ->
+                stubRegistry.releaseAllStubsForSlot(persistedSlot)
+            }
         }
         return VmResult.Success(Unit)
     }
@@ -838,11 +853,40 @@ class VirtualEngine @Inject constructor(
                 virtualRoot.mkdirs()
             }
             val app = findApp(instanceId)
+            // Sanitize stale arm64 search paths when running on non-ARM (x86_64 emulator).
+            val searchPath = app?.librarySearchPath?.ifEmpty { null }?.let { path ->
+                val deviceAbis = android.os.Build.SUPPORTED_ABIS.toList()
+                val pathLooksArm = path.contains("arm64-v8a") || path.contains("armeabi")
+                val deviceIsArm = deviceAbis.any { it.startsWith("arm") }
+                if (pathLooksArm && !deviceIsArm) {
+                    NativeLibManager.rebuildLibrarySearchPath(
+                        libDir = app.libDir.ifEmpty {
+                            File(virtualRoot, "data/$instanceId/lib").absolutePath
+                        },
+                        apkPath = apkPath,
+                        splitApkPaths = app.splitApkPaths,
+                        preferredAbi = deviceAbis.firstOrNull() ?: ""
+                    ).also {
+                        Timber.tag(TAG).w(
+                            "Sanitized librarySearchPath for $instanceId: $path → $it"
+                        )
+                    }
+                } else {
+                    path
+                }
+            }
+            // Also purge/re-extract wrong-ABI .so before ClassLoader binds to lib dir
+            NativeLibManager.reExtractIfMissing(
+                apkPath = apkPath,
+                splitApkPaths = app?.splitApkPaths ?: emptyList(),
+                instanceId = instanceId,
+                dataRoot = File(virtualRoot, "data")
+            )
             VirtualClassLoader.createClassLoader(
                 apkPath = apkPath,
                 instanceId = instanceId,
                 parentDir = virtualRoot,
-                prebuiltLibrarySearchPath = app?.librarySearchPath?.ifEmpty { null },
+                prebuiltLibrarySearchPath = searchPath,
                 splitApkPaths = app?.splitApkPaths ?: emptyList()
             ).also { cl ->
                 val pkg = findApp(instanceId)?.packageName ?: instanceId.substringBefore('_')
@@ -1087,7 +1131,25 @@ class VirtualEngine @Inject constructor(
                     // Reload icon from APK since Drawable is not serialized
                     var appWithIcon = reloadIconFromApk(app)
 
-                    // Re-extract native libs if missing (fixes previously broken installs)
+                    // Repair launcher activities saved by older parser versions.
+                    // Archive PackageInfo omits intent filters, so the old
+                    // name-based heuristic could select MainActivity instead of
+                    // the actual MAIN + LAUNCHER privacy/splash entry point.
+                    val manifestLauncher = frameworkApkParser.findMainLauncherActivity(
+                        File(appWithIcon.apkPath)
+                    )
+                    if (manifestLauncher != null &&
+                        manifestLauncher != appWithIcon.mainActivity
+                    ) {
+                        Timber.tag(TAG).i(
+                            "Updated launcher for ${appWithIcon.packageName}: " +
+                                "${appWithIcon.mainActivity} → $manifestLauncher"
+                        )
+                        appWithIcon = appWithIcon.copy(mainActivity = manifestLauncher)
+                        saveVirtualApp(appWithIcon)
+                    }
+
+                    // Re-extract native libs if missing OR wrong ABI (e.g. arm64 on x86_64 emulator)
                     val dataRoot = File(virtualRoot, "data")
                     val reResult = NativeLibManager.reExtractIfMissing(
                         apkPath = appWithIcon.apkPath,
@@ -1102,6 +1164,27 @@ class VirtualEngine @Inject constructor(
                             primaryAbi = reResult.selectedAbi
                         )
                         saveVirtualApp(appWithIcon)
+                    } else if (appWithIcon.librarySearchPath.contains("arm64") &&
+                        !android.os.Build.SUPPORTED_ABIS.any { it.startsWith("arm") }
+                    ) {
+                        // Stale search path from a previous bad install — rebuild for this device
+                        val rebuilt = NativeLibManager.rebuildLibrarySearchPath(
+                            libDir = appWithIcon.libDir.ifEmpty {
+                                File(dataRoot, "${appWithIcon.instanceId}/lib").absolutePath
+                            },
+                            apkPath = appWithIcon.apkPath,
+                            splitApkPaths = appWithIcon.splitApkPaths,
+                            preferredAbi = appWithIcon.primaryAbi
+                        )
+                        appWithIcon = appWithIcon.copy(
+                            librarySearchPath = rebuilt,
+                            primaryAbi = android.os.Build.SUPPORTED_ABIS.firstOrNull()
+                                ?: appWithIcon.primaryAbi
+                        )
+                        saveVirtualApp(appWithIcon)
+                        Timber.tag(TAG).w(
+                            "Rebuilt librarySearchPath for ${appWithIcon.packageName}: $rebuilt"
+                        )
                     }
 
                     apps.add(appWithIcon)
@@ -1255,6 +1338,14 @@ class VirtualEngine @Inject constructor(
                 }
             }
 
+            // Spoof /proc/self/cmdline before Application boot so isMainProcess
+            // checks that read cmdline see the guest package name.
+            try {
+                nativeHookBridge.spoofProcSelf(android.os.Process.myPid(), packageName)
+            } catch (e: Exception) {
+                Timber.tag(TAG).w(e, "spoofProcSelf failed for $packageName (non-fatal)")
+            }
+
             // Boot the Application via ApplicationManager
             applicationManager.bindApplication(
                 instanceId = instanceId,
@@ -1318,6 +1409,15 @@ class VirtualEngine @Inject constructor(
     fun getActivityThemeResId(packageName: String, activityName: String): Int {
         if (!::binderProxyManager.isInitialized) return 0
         return binderProxyManager.getActivityTheme(packageName, activityName)
+    }
+
+    /**
+     * Rewrite guest startActivity Intents onto host stubs.
+     * Called from NextVmInstrumentation.execStartActivity — see ActivityManagerProxy.
+     */
+    fun rewriteOutgoingStartActivityIntent(intent: android.content.Intent): Boolean {
+        if (!::binderProxyManager.isInitialized) return false
+        return binderProxyManager.rewriteOutgoingStartActivityIntent(intent)
     }
 
     /**

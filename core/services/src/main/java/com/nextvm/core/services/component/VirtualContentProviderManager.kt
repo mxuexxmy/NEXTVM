@@ -133,17 +133,38 @@ class VirtualContentProviderManager @Inject constructor() {
                 ctor.newInstance()
             } as ContentProvider
 
-            // Step 3: Build ProviderInfo
+            // Step 3: Build ProviderInfo — prefer archive meta-data when available
+            val archiveInfo = try {
+                val flags = android.content.pm.PackageManager.GET_PROVIDERS or
+                    android.content.pm.PackageManager.GET_META_DATA
+                val pkg = context.packageManager.getPackageArchiveInfo(
+                    // Prefer sourceDir from applicationInfo when set by VirtualContext
+                    context.applicationInfo.sourceDir,
+                    flags
+                )
+                pkg?.providers?.firstOrNull { it.name == providerClassName }?.also { pi ->
+                    pi.packageName = packageName
+                    pi.applicationInfo = pkg.applicationInfo?.also { ai ->
+                        ai.sourceDir = context.applicationInfo.sourceDir
+                        ai.publicSourceDir = context.applicationInfo.sourceDir
+                    }
+                }
+            } catch (_: Exception) {
+                null
+            }
+
             val providerInfo = ProviderInfo().apply {
                 this.name = providerClassName
                 this.authority = authority
-                this.applicationInfo = context.applicationInfo
-                this.readPermission = readPermission
-                this.writePermission = writePermission
+                this.packageName = packageName
+                this.applicationInfo = archiveInfo?.applicationInfo ?: context.applicationInfo
+                this.readPermission = readPermission ?: archiveInfo?.readPermission
+                this.writePermission = writePermission ?: archiveInfo?.writePermission
                 this.exported = exported
-                this.grantUriPermissions = grantUriPermissions
+                this.grantUriPermissions = grantUriPermissions || (archiveInfo?.grantUriPermissions == true)
                 this.multiprocess = multiProcess
                 this.enabled = true
+                this.metaData = archiveInfo?.metaData
             }
 
             // Step 4: Call attachInfo (this calls onCreate internally)

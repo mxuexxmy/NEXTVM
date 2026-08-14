@@ -35,9 +35,14 @@ class StubRegistry {
     /**
      * Resolve a stub Activity for the given process slot and launch mode.
      *
+     * Prefers an unused stub matching [launchMode]. If that pool is exhausted,
+     * falls back to other launch-mode pools (starting with standard), then
+     * reuses an already-marked stub so relaunch after a leaked reservation
+     * still works.
+     *
      * @param slot Process slot index (0, 1, 2...)
      * @param launchMode Android launch mode: "standard", "singleTop", "singleTask", "singleInstance"
-     * @return Fully qualified stub class name, or null if no slot available
+     * @return Fully qualified stub class name, or null if no mapping exists
      */
     fun resolveStub(slot: Int, launchMode: String): String? {
         val mapping = slots[slot]
@@ -46,21 +51,38 @@ class StubRegistry {
             return null
         }
 
-        val candidates = when (launchMode) {
+        fun candidatesFor(mode: String): List<String> = when (mode) {
             "singleTop" -> mapping.stubActivitySingleTop
             "singleTask" -> mapping.stubActivitySingleTask
             "singleInstance" -> mapping.stubActivitySingleInstance
-            else -> mapping.stubActivityStandard // "standard" is the default
+            else -> mapping.stubActivityStandard
         }
 
-        val available = candidates.firstOrNull { it !in inUseStubs }
-        if (available != null) {
-            inUseStubs.add(available)
-            Timber.tag(TAG).d("Resolved stub: $available (slot=$slot, mode=$launchMode)")
-        } else {
-            Timber.tag(TAG).w("No available $launchMode stubs for slot $slot")
+        val modeOrder = listOf(launchMode, "standard", "singleTop", "singleTask", "singleInstance")
+            .distinct()
+
+        // 1) Prefer a free stub in preferred / fallback modes
+        for (mode in modeOrder) {
+            val available = candidatesFor(mode).firstOrNull { it !in inUseStubs }
+            if (available != null) {
+                inUseStubs.add(available)
+                Timber.tag(TAG).d("Resolved stub: $available (slot=$slot, mode=$mode, requested=$launchMode)")
+                return available
+            }
         }
-        return available
+
+        // 2) All stubs reserved (typical after leaked launches) — reuse first candidate
+        for (mode in modeOrder) {
+            val reusable = candidatesFor(mode).firstOrNull()
+            if (reusable != null) {
+                inUseStubs.add(reusable)
+                Timber.tag(TAG).w("Reusing in-use stub: $reusable (slot=$slot, mode=$mode)")
+                return reusable
+            }
+        }
+
+        Timber.tag(TAG).w("No stubs configured for slot $slot")
+        return null
     }
 
     /**

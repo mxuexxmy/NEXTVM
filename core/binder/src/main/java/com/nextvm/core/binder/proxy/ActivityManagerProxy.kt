@@ -158,10 +158,22 @@ class ActivityManagerProxy(
      * return as if the permission was already granted.
      */
     private fun handleStartActivity(method: Method, args: Array<out Any>?): Any? {
-        if (args == null) return invokeOriginal(method, args)
+        return handleStartActivityVia(method, args, original)
+    }
+
+    /**
+     * Shared startActivity* handling for IActivityManager and IActivityTaskManager.
+     *
+     * Modern Android routes [android.app.Activity.startActivity] through
+     * IActivityTaskManager; IActivityManager alone never sees those calls.
+     *
+     * @param binder original AMS or ATM Binder stub to invoke after rewriting args
+     */
+    fun handleStartActivityVia(method: Method, args: Array<out Any>?, binder: Any): Any? {
+        if (args == null) return method.invoke(binder)
 
         val intentIndex = args.indexOfFirst { it is Intent }
-        if (intentIndex < 0) return invokeOriginal(method, args)
+        if (intentIndex < 0) return method.invoke(binder, *args)
 
         val intent = args[intentIndex] as Intent
 
@@ -205,11 +217,6 @@ class ActivityManagerProxy(
             }
         }
 
-        // If this already has NEXTVM extras, it's our own stub launch — pass through
-        if (intent.hasExtra(VirtualIntentExtras.TARGET_PACKAGE)) {
-            return invokeOriginal(method, args)
-        }
-
         // FIX: Replace callingPackage (args[1]) with host package.
         // Android 16 AIDL: startActivity(IApplicationThread, String callingPackage, Intent, ...)
         // The system server checks callingPackage against the caller's UID.
@@ -219,31 +226,51 @@ class ActivityManagerProxy(
             newArgs[1] = hostPackage
         }
 
-        // Check if target is a virtual app
-        val resolvedTargetPkg = intent.component?.packageName ?: intent.`package`
-        if (resolvedTargetPkg != null && virtualApps.containsKey(resolvedTargetPkg)) {
-            val app = virtualApps[resolvedTargetPkg]!!
-            val targetClass = intent.component?.className ?: app.mainActivity
+        // Rewrite guest-to-guest Intents onto host stubs (mutates Intent in place).
+        // Critical for IActivityTaskManager: without this, non-exported guest activities
+        // resolve to a same-package host install → SecurityException.
+        rewriteOutgoingStartActivityIntent(intent)
 
-            if (targetClass != null) {
-                Timber.tag(TAG).d("Intercepting startActivity: $resolvedTargetPkg/$targetClass")
+        return method.invoke(binder, *newArgs)
+    }
 
-                // Create new Intent pointing to stub
-                val newIntent = Intent(intent).apply {
-                    setClassName(hostPackage, getStubForApp(app))
-                    putExtra(VirtualIntentExtras.TARGET_PACKAGE, resolvedTargetPkg)
-                    putExtra(VirtualIntentExtras.TARGET_ACTIVITY, targetClass)
-                    putExtra(VirtualIntentExtras.INSTANCE_ID, app.instanceId)
-                    putExtra(VirtualIntentExtras.APK_PATH, app.apkPath)
-                    putExtra(VirtualIntentExtras.PROCESS_SLOT, app.processSlot)
-                }
-
-                newArgs[intentIndex] = newIntent
-                return method.invoke(original, *newArgs)
-            }
+    /**
+     * Rewrite an outgoing startActivity Intent when it targets a registered virtual app.
+     *
+     * Mutates [intent] in place so callers that hold the same Intent reference
+     * (e.g. Instrumentation.execStartActivity) see the stub component.
+     *
+     * Without this, guest apps that start their own non-exported activities resolve
+     * against a same-package host install and crash with:
+     *   SecurityException: ... not exported from uid XXX
+     *
+     * @return true if the Intent was rewritten to a host stub
+     */
+    fun rewriteOutgoingStartActivityIntent(intent: Intent): Boolean {
+        if (intent.hasExtra(VirtualIntentExtras.TARGET_PACKAGE)) {
+            return false
         }
 
-        return method.invoke(original, *newArgs)
+        val resolvedTargetPkg = intent.component?.packageName ?: intent.`package` ?: return false
+        if (!virtualApps.containsKey(resolvedTargetPkg)) {
+            return false
+        }
+
+        val app = virtualApps[resolvedTargetPkg] ?: return false
+        val targetClass = intent.component?.className ?: app.mainActivity ?: return false
+
+        Timber.tag(TAG).d(
+            "Rewriting startActivity Intent: $resolvedTargetPkg/$targetClass → stub " +
+                "(slot=${app.processSlot}, instance=${app.instanceId})"
+        )
+
+        intent.setClassName(hostPackage, getStubForApp(app))
+        intent.putExtra(VirtualIntentExtras.TARGET_PACKAGE, resolvedTargetPkg)
+        intent.putExtra(VirtualIntentExtras.TARGET_ACTIVITY, targetClass)
+        intent.putExtra(VirtualIntentExtras.INSTANCE_ID, app.instanceId)
+        intent.putExtra(VirtualIntentExtras.APK_PATH, app.apkPath)
+        intent.putExtra(VirtualIntentExtras.PROCESS_SLOT, app.processSlot)
+        return true
     }
 
     /**
@@ -559,14 +586,39 @@ class ActivityManagerProxy(
         // Get real process list from the system
         val result = invokeOriginal(method, args) ?: return null
 
-        // Filter: virtual apps should only see their own processes
-        // This prevents detection of the host app's processes
+        // Guest isMainProcess() often does:
+        //   for (info : am.getRunningAppProcesses())
+        //     if (info.pid == myPid()) return info.processName.equals(packageName)
+        // Host stub processes are named "com.nextvm.app:pN" — rewrite to guest pkg.
         try {
             @Suppress("UNCHECKED_CAST")
             val processList = result as? List<Any> ?: return result
+            val guestPkg = findCallingGuestPkg() ?: return result
+            val myPid = android.os.Process.myPid()
 
-            // For now, pass through — fine-grained filtering can be added
-            // when anti-detection for specific apps is needed
+            for (info in processList) {
+                val pidField = findField(info.javaClass, "pid") ?: continue
+                pidField.isAccessible = true
+                val pid = pidField.get(info) as? Int ?: continue
+                if (pid != myPid) continue
+
+                val processNameField = findField(info.javaClass, "processName") ?: continue
+                processNameField.isAccessible = true
+                val oldName = processNameField.get(info) as? String
+                if (oldName != guestPkg) {
+                    processNameField.set(info, guestPkg)
+                    Timber.tag(TAG).d(
+                        "getRunningAppProcesses: pid=$myPid processName '$oldName' → '$guestPkg'"
+                    )
+                }
+
+                // pkgList often contains host package; rewrite so detectors match guest
+                val pkgListField = findField(info.javaClass, "pkgList")
+                if (pkgListField != null) {
+                    pkgListField.isAccessible = true
+                    pkgListField.set(info, arrayOf(guestPkg))
+                }
+            }
             return result
         } catch (e: Exception) {
             Timber.tag(TAG).w("Error filtering process list: ${e.message}")
@@ -686,8 +738,22 @@ class ActivityManagerProxy(
 
     /**
      * Find the package name of the currently calling guest app.
+     * Prefer the spoofed process name (guest package) over map insertion order —
+     * stub processes register ALL virtual apps during engine init.
      */
     private fun findCallingGuestPkg(): String? {
+        val processName = try {
+            if (android.os.Build.VERSION.SDK_INT >= 28) {
+                android.app.Application.getProcessName()
+            } else {
+                null
+            }
+        } catch (_: Throwable) {
+            null
+        }
+        if (processName != null && virtualApps.containsKey(processName)) {
+            return processName
+        }
         return virtualApps.values.firstOrNull { it.processSlot >= 0 }?.packageName
             ?: virtualApps.keys.firstOrNull()
     }

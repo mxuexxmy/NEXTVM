@@ -116,7 +116,11 @@ object VirtualClassLoader {
             librarySearchPath
         }
 
-        val classLoader = PathClassLoader(
+        // GuestPathClassLoader hides java.lang.ClassValue from guest-initiated
+        // Class.forName lookups so kotlin-reflect / kotlinx caches take the
+        // ConcurrentHashMap path. R8-stripped ComputableClassValue.computeValue
+        // otherwise crashes with AbstractMethodError on API 34+ (Android 14+).
+        val classLoader = GuestPathClassLoader(
             dexPath,
             fullLibrarySearchPath,
             ClassLoader.getSystemClassLoader()
@@ -360,5 +364,38 @@ object VirtualClassLoader {
         } catch (e: Exception) {
             return false
         }
+    }
+}
+
+/**
+ * PathClassLoader for guest apps that forces kotlin-reflect off the broken
+ * ClassValue cache path used by some R8-shrunk APKs on Android 14+.
+ *
+ * kotlin-reflect probes `Class.forName("java.lang.ClassValue")` and, if found,
+ * instantiates ComputableClassValue. When R8 previously stripped computeValue
+ * (compiled against an android.jar without ClassValue), that path throws
+ * AbstractMethodError. Hiding ClassValue only for guest-initiated lookups
+ * makes the probe fail and selects ConcurrentHashMapCache instead.
+ *
+ * Boot/framework code still sees the real ClassValue via the parent loader;
+ * we only intercept loadClass on this guest loader (the initiating loader for
+ * guest kotlin-reflect).
+ */
+internal class GuestPathClassLoader(
+    dexPath: String,
+    librarySearchPath: String,
+    parent: ClassLoader
+) : PathClassLoader(dexPath, librarySearchPath, parent) {
+
+    @Throws(ClassNotFoundException::class)
+    override fun loadClass(name: String, resolve: Boolean): Class<*> {
+        if (name == CLASS_VALUE_NAME) {
+            throw ClassNotFoundException(name)
+        }
+        return super.loadClass(name, resolve)
+    }
+
+    companion object {
+        private const val CLASS_VALUE_NAME = "java.lang.ClassValue"
     }
 }

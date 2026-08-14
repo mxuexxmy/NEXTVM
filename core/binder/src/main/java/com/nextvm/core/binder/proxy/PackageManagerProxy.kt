@@ -1,10 +1,12 @@
 package com.nextvm.core.binder.proxy
 
+import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.content.pm.ApplicationInfo
 import android.content.pm.ActivityInfo
+import android.content.pm.ProviderInfo
 import com.nextvm.core.model.GmsServiceRouter
 import com.nextvm.core.model.VirtualApp
 import com.nextvm.core.model.VirtualConstants
@@ -87,12 +89,18 @@ class PackageManagerProxy(
                 "getPackageInfo" -> handleGetPackageInfo(method, args)
                 "getApplicationInfo" -> handleGetApplicationInfo(method, args)
                 "getActivityInfo" -> handleGetActivityInfo(method, args)
+                "getServiceInfo" -> handleGetServiceInfo(method, args)
+                "getReceiverInfo" -> handleGetReceiverInfo(method, args)
+                "getProviderInfo" -> handleGetProviderInfo(method, args)
+                "resolveContentProvider" -> handleResolveContentProvider(method, args)
                 "resolveIntent" -> handleResolveIntent(method, args)
                 "queryIntentActivities" -> handleQueryIntentActivities(method, args)
                 "getInstalledPackages" -> handleGetInstalledPackages(method, args)
                 "getPackageUid" -> handleGetPackageUid(method, args)
                 "checkPermission" -> handleCheckPermission(method, args)
                 "checkUidPermission" -> handleCheckUidPermission(method, args)
+                "getInstallerPackageName" -> handleGetInstallerPackageName(method, args)
+                "getInstallSourceInfo" -> handleGetInstallSourceInfo(method, args)
 
                 // Splash screen APIs — guest app can't own its package at system level.
                 // These throw SecurityException ("Calling uid XXXX does not own package")
@@ -121,11 +129,18 @@ class PackageManagerProxy(
             Timber.tag(TAG).e(e, "Error in proxy method: $methodName")
             // For SecurityExceptions from virtual app operations, swallow rather than propagate
             val cause = if (e is java.lang.reflect.InvocationTargetException) e.cause else e
-            if (cause is SecurityException) {
-                Timber.tag(TAG).w("PM SecurityException swallowed for $methodName: ${cause.message}")
-                null
-            } else {
-                invokeOriginal(method, args)
+            when {
+                cause is SecurityException -> {
+                    Timber.tag(TAG).w("PM SecurityException swallowed for $methodName: ${cause.message}")
+                    null
+                }
+                // WebView BuildInfo / Chromium: unknown virtual package must not crash factory init
+                cause is IllegalArgumentException &&
+                    (methodName == "getInstallerPackageName" || methodName == "getInstallSourceInfo") -> {
+                    Timber.tag(TAG).w("PM IllegalArgumentException swallowed for $methodName: ${cause.message}")
+                    if (methodName == "getInstallSourceInfo") synthesizeInstallSourceInfo() else null
+                }
+                else -> invokeOriginal(method, args)
             }
         }
     }
@@ -214,8 +229,108 @@ class PackageManagerProxy(
     }
 
     private fun handleGetActivityInfo(method: Method, args: Array<out Any>?): Any? {
-        // TODO: Return virtual ActivityInfo for virtual app activities
+        if (args == null || args.isEmpty()) return invokeOriginal(method, args)
+        val component = args[0] as? ComponentName ?: return invokeOriginal(method, args)
+        if (!virtualApps.containsKey(component.packageName)) {
+            return invokeOriginal(method, args)
+        }
+        val activity = packageInfoCache[component.packageName]
+            ?.activities
+            ?.firstOrNull { it.name == component.className }
+        if (activity != null) {
+            Timber.tag(TAG).d(
+                "Returning virtual ActivityInfo for ${component.flattenToShortString()} " +
+                    "(meta=${activity.metaData != null})"
+            )
+        }
+        return activity
+    }
+
+    /**
+     * Firebase ComponentDiscovery reads registrar declarations from the
+     * ComponentDiscoveryService's meta-data via getServiceInfo(GET_META_DATA).
+     */
+    private fun handleGetServiceInfo(method: Method, args: Array<out Any>?): Any? {
+        if (args == null || args.isEmpty()) return invokeOriginal(method, args)
+        val component = args[0] as? ComponentName ?: return invokeOriginal(method, args)
+        if (!virtualApps.containsKey(component.packageName)) {
+            return invokeOriginal(method, args)
+        }
+        val service = packageInfoCache[component.packageName]
+            ?.services
+            ?.firstOrNull { it.name == component.className }
+        if (service != null) {
+            Timber.tag(TAG).d(
+                "Returning virtual ServiceInfo for ${component.flattenToShortString()} " +
+                    "(meta=${service.metaData != null})"
+            )
+        }
+        return service
+    }
+
+    private fun handleGetReceiverInfo(method: Method, args: Array<out Any>?): Any? {
+        if (args == null || args.isEmpty()) return invokeOriginal(method, args)
+        val component = args[0] as? ComponentName ?: return invokeOriginal(method, args)
+        if (!virtualApps.containsKey(component.packageName)) {
+            return invokeOriginal(method, args)
+        }
+        return packageInfoCache[component.packageName]
+            ?.receivers
+            ?.firstOrNull { it.name == component.className }
+    }
+
+    /**
+     * Return guest ProviderInfo (with meta-data) for FileProvider / Startup / etc.
+     * AIDL: ProviderInfo getProviderInfo(ComponentName className, long flags, int userId)
+     */
+    private fun handleGetProviderInfo(method: Method, args: Array<out Any>?): Any? {
+        if (args == null || args.isEmpty()) return invokeOriginal(method, args)
+        val component = args[0] as? ComponentName ?: return invokeOriginal(method, args)
+        if (!virtualApps.containsKey(component.packageName)) {
+            return invokeOriginal(method, args)
+        }
+        val provider = findProviderInfo(component.packageName, component.className)
+        if (provider != null) {
+            Timber.tag(TAG).d(
+                "Returning virtual ProviderInfo for ${component.flattenToShortString()} " +
+                    "(meta=${provider.metaData != null})"
+            )
+            return provider
+        }
+        Timber.tag(TAG).w("No virtual ProviderInfo for ${component.flattenToShortString()}")
+        return null
+    }
+
+    /**
+     * Resolve guest content authority → ProviderInfo (needs meta-data for FileProvider paths).
+     * AIDL: ProviderInfo resolveContentProvider(String name, long flags, int userId)
+     */
+    private fun handleResolveContentProvider(method: Method, args: Array<out Any>?): Any? {
+        if (args == null || args.isEmpty()) return invokeOriginal(method, args)
+        val authority = args[0] as? String ?: return invokeOriginal(method, args)
+
+        for (pkg in virtualApps.keys) {
+            val provider = findProviderByAuthority(pkg, authority)
+            if (provider != null) {
+                Timber.tag(TAG).d(
+                    "resolveContentProvider($authority) → ${provider.name} " +
+                        "(meta=${provider.metaData != null})"
+                )
+                return provider
+            }
+        }
         return invokeOriginal(method, args)
+    }
+
+    private fun findProviderInfo(packageName: String, className: String): ProviderInfo? {
+        return packageInfoCache[packageName]?.providers?.firstOrNull { it.name == className }
+    }
+
+    private fun findProviderByAuthority(packageName: String, authority: String): ProviderInfo? {
+        val providers = packageInfoCache[packageName]?.providers ?: return null
+        return providers.firstOrNull { info ->
+            info.authority?.split(';')?.any { it.trim() == authority } == true
+        }
     }
 
     private fun handleResolveIntent(method: Method, args: Array<out Any>?): Any? {
@@ -245,6 +360,104 @@ class PackageManagerProxy(
         }
 
         return invokeOriginal(method, args)
+    }
+
+    /**
+     * WebView / Chromium BuildInfo calls getInstallerPackageName(guestPkg).
+     * Real PMS throws IllegalArgumentException for packages not system-installed.
+     * Return null (valid "unknown installer") for virtual guests.
+     */
+    private fun handleGetInstallerPackageName(method: Method, args: Array<out Any>?): Any? {
+        val packageName = args?.getOrNull(0) as? String
+        if (packageName != null && virtualApps.containsKey(packageName)) {
+            Timber.tag(TAG).d("getInstallerPackageName($packageName) → null (virtual)")
+            return null
+        }
+        return try {
+            invokeOriginal(method, args)
+        } catch (e: Exception) {
+            val cause = if (e is java.lang.reflect.InvocationTargetException) e.cause else e
+            if (cause is IllegalArgumentException) {
+                Timber.tag(TAG).d("getInstallerPackageName($packageName) → null (unknown pkg)")
+                null
+            } else {
+                throw e
+            }
+        }
+    }
+
+    /**
+     * API 30+ replacement for getInstallerPackageName. Chromium may call this path.
+     * Synthesize an empty InstallSourceInfo for virtual packages.
+     */
+    private fun handleGetInstallSourceInfo(method: Method, args: Array<out Any>?): Any? {
+        val packageName = args?.getOrNull(0) as? String
+        if (packageName != null && virtualApps.containsKey(packageName)) {
+            Timber.tag(TAG).d("getInstallSourceInfo($packageName) → synthetic (virtual)")
+            return synthesizeInstallSourceInfo()
+                ?: invokeOriginalSafeNull(method, args)
+        }
+        return try {
+            invokeOriginal(method, args)
+        } catch (e: Exception) {
+            val cause = if (e is java.lang.reflect.InvocationTargetException) e.cause else e
+            if (cause is IllegalArgumentException || cause is PackageManager.NameNotFoundException) {
+                synthesizeInstallSourceInfo()
+            } else {
+                throw e
+            }
+        }
+    }
+
+    private fun invokeOriginalSafeNull(method: Method, args: Array<out Any>?): Any? {
+        return try {
+            invokeOriginal(method, args)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Build android.content.pm.InstallSourceInfo with all-null installer fields.
+     * Chromium accepts this; avoids IllegalArgumentException from real PMS.
+     */
+    private fun synthesizeInstallSourceInfo(): Any? {
+        return try {
+            val clazz = Class.forName("android.content.pm.InstallSourceInfo")
+            // Prefer 4-arg ctor: (initiating, SigningInfo, originating, installing)
+            val ctors = clazz.declaredConstructors
+            for (ctor in ctors) {
+                ctor.isAccessible = true
+                val params = ctor.parameterTypes
+                when (params.size) {
+                    4 -> {
+                        // (String, SigningInfo, String, String) — common AOSP shape
+                        if (params[0] == String::class.java && params[2] == String::class.java) {
+                            return ctor.newInstance(null, null, null, null)
+                        }
+                    }
+                    5 -> {
+                        // Later APIs add updateOwnerPackageName
+                        if (params[0] == String::class.java) {
+                            return ctor.newInstance(null, null, null, null, null)
+                        }
+                    }
+                    6 -> {
+                        if (params[0] == String::class.java) {
+                            return ctor.newInstance(null, null, null, null, null, null)
+                        }
+                    }
+                }
+            }
+            // Last resort: any ctor filled with nulls
+            val ctor = ctors.minByOrNull { it.parameterCount } ?: return null
+            ctor.isAccessible = true
+            val nulls = arrayOfNulls<Any>(ctor.parameterCount)
+            ctor.newInstance(*nulls)
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "Failed to synthesize InstallSourceInfo")
+            null
+        }
     }
 
     private fun handleCheckPermission(method: Method, args: Array<out Any>?): Any? {
@@ -431,6 +644,11 @@ class PackageManagerProxy(
             info.providers = providers.toTypedArray()
             info.requestedPermissions = permissions.toTypedArray()
 
+            // Prefer archive component records, which retain manifest meta-data.
+            // This is required by Firebase ComponentDiscoveryService, FlutterActivity,
+            // FileProvider, AndroidX Startup, and other manifest-driven SDKs.
+            enrichComponentsFromArchive(app, info, appInfo)
+
             // Extract signing certificates from APK so GMS/Firebase can verify
             // the app's identity (fingerprint hash, GoogleSignatureVerifier, etc.)
             try {
@@ -461,9 +679,78 @@ class PackageManagerProxy(
 
             packageInfoCache[packageName] = info
             Timber.tag(TAG).d("parseApkDirect: cached PackageInfo for $packageName " +
-                    "(${activities.size} activities, ${services.size} services)")
+                    "(${info.activities?.size ?: 0} activities, ${info.services?.size ?: 0} services, " +
+                    "${info.providers?.size ?: 0} providers)")
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "parseApkDirect failed for ${app.packageName}")
+        }
+    }
+
+    /**
+     * Replace XML-only component stubs with PackageManager archive records so all
+     * ComponentInfo meta-data is retained.
+     */
+    private fun enrichComponentsFromArchive(
+        app: VirtualApp,
+        info: PackageInfo,
+        appInfo: ApplicationInfo
+    ) {
+        try {
+            val flags = PackageManager.GET_ACTIVITIES or
+                PackageManager.GET_SERVICES or
+                PackageManager.GET_RECEIVERS or
+                PackageManager.GET_PROVIDERS or
+                PackageManager.GET_META_DATA
+            val archive = context.packageManager.getPackageArchiveInfo(app.apkPath, flags)
+                ?: return
+            val componentAppInfo = (archive.applicationInfo ?: appInfo).apply {
+                packageName = app.packageName
+                sourceDir = app.apkPath
+                publicSourceDir = app.apkPath
+                dataDir = appInfo.dataDir
+                nativeLibraryDir = appInfo.nativeLibraryDir
+                enabled = true
+            }
+
+            archive.activities?.takeIf { it.isNotEmpty() }?.let { activities ->
+                info.activities = activities.onEach { activity ->
+                    activity.packageName = app.packageName
+                    activity.applicationInfo = componentAppInfo
+                }
+            }
+            archive.services?.takeIf { it.isNotEmpty() }?.let { services ->
+                info.services = services.onEach { service ->
+                    service.packageName = app.packageName
+                    service.applicationInfo = componentAppInfo
+                }
+            }
+            archive.receivers?.takeIf { it.isNotEmpty() }?.let { receivers ->
+                info.receivers = receivers.onEach { receiver ->
+                    receiver.packageName = app.packageName
+                    receiver.applicationInfo = componentAppInfo
+                }
+            }
+            archive.providers?.takeIf { it.isNotEmpty() }?.let { providers ->
+                val xmlByName = info.providers?.associateBy { it.name }.orEmpty()
+                info.providers = providers.onEach { provider ->
+                    provider.packageName = app.packageName
+                    provider.applicationInfo = componentAppInfo
+                    if (provider.authority.isNullOrEmpty()) {
+                        provider.authority = xmlByName[provider.name]?.authority
+                    }
+                }
+            }
+
+            Timber.tag(TAG).d(
+                "enrichComponentsFromArchive: ${app.packageName} " +
+                    "(activities=${info.activities?.size ?: 0}, " +
+                    "services=${info.services?.size ?: 0}, " +
+                    "serviceMeta=${info.services?.count { it.metaData != null } ?: 0}, " +
+                    "providers=${info.providers?.size ?: 0}, " +
+                    "providerMeta=${info.providers?.count { it.metaData != null } ?: 0})"
+            )
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "enrichComponentsFromArchive failed for ${app.packageName}")
         }
     }
 

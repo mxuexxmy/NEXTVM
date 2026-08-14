@@ -5,6 +5,7 @@ import android.app.Instrumentation
 import android.content.ContentProvider
 import android.content.Context
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.content.pm.ProviderInfo
 import android.content.res.Configuration
 import android.os.Build
@@ -157,6 +158,13 @@ class VirtualApplicationManager @Inject constructor() {
                 virtualContext.setGuestApplication(application)
             }
 
+            // Step 3.6: Spoof process identity BEFORE attachBaseContext/onCreate.
+            // Guest apps commonly gate EasyHttp / SDK init with isMainProcess():
+            //   packageName.equals(Application.getProcessName())
+            // Without this, host process "com.nextvm.app:p0" fails the check and
+            // network stacks throw "请先调用 EasyHttp.init()".
+            spoofGuestProcessIdentity(packageName, application)
+
             // Step 4: Attach base context
             attachBaseContext(application, virtualContext)
             record.state = ApplicationState.ATTACHED
@@ -179,7 +187,8 @@ class VirtualApplicationManager @Inject constructor() {
                     authorities = providerAuthorities,
                     classLoader = classLoader,
                     virtualContext = virtualContext,
-                    application = application
+                    application = application,
+                    apkPath = apkPath
                 )
                 record.state = ApplicationState.PROVIDERS_INSTALLED
                 Timber.tag(TAG).d("ContentProviders installed: ${providerNames.size}")
@@ -316,7 +325,13 @@ class VirtualApplicationManager @Inject constructor() {
         patchJiaguStubBeforeAttach(application, virtualContext)
 
         // FIX 3: Install Runtime.load0 caller fix to handle null caller class.
-        installRuntimeLoadCallerFix(application, virtualContext)
+        // Pass the guest ClassLoader explicitly — android.app.Application is loaded by
+        // BootClassLoader, so application.javaClass.classLoader is wrong for Flutter/JNI.
+        val guestCl = when (virtualContext) {
+            is com.nextvm.core.sandbox.VirtualContext -> virtualContext.classLoader
+            else -> null
+        } ?: application.classLoader
+        installRuntimeLoadCallerFix(application, virtualContext, guestCl)
 
         try {
             // Try the full attach() method first (mirrors real Android flow)
@@ -470,13 +485,25 @@ class VirtualApplicationManager @Inject constructor() {
      *    CodeSource pointing to the guest APK path
      * 3. The actual JNI-level fix is in NativeHookBridge.hookRuntimeNativeLoad()
      */
-    private fun installRuntimeLoadCallerFix(application: Application, virtualContext: Context) {
+    private fun installRuntimeLoadCallerFix(
+        application: Application,
+        virtualContext: Context,
+        guestClassLoader: ClassLoader?
+    ) {
         try {
-            // Ensure the current thread's contextClassLoader is the guest's ClassLoader.
-            val guestClassLoader = application.javaClass.classLoader
-            if (guestClassLoader != null) {
-                Thread.currentThread().contextClassLoader = guestClassLoader
-                Timber.tag(TAG).d("Set thread contextClassLoader to guest ClassLoader: ${guestClassLoader.javaClass.name}")
+            // Prefer the guest Dex/Path ClassLoader, never BootClassLoader from
+            // framework android.app.Application.
+            val cl = guestClassLoader?.takeUnless {
+                it.javaClass.name.contains("BootClassLoader")
+            } ?: application.javaClass.classLoader?.takeUnless {
+                it.javaClass.name.contains("BootClassLoader")
+            }
+
+            if (cl != null) {
+                Thread.currentThread().contextClassLoader = cl
+                Timber.tag(TAG).d("Set thread contextClassLoader to guest ClassLoader: ${cl.javaClass.name}")
+            } else {
+                Timber.tag(TAG).w("No guest ClassLoader available for contextClassLoader")
             }
 
             // Ensure the guest's Application class has a valid ProtectionDomain
@@ -634,11 +661,17 @@ class VirtualApplicationManager @Inject constructor() {
         authorities: Map<String, String>,
         classLoader: ClassLoader,
         virtualContext: Context,
-        application: Application
+        application: Application,
+        apkPath: String? = null
     ) {
         Timber.tag(TAG).d("Installing ${providers.size} ContentProviders for $instanceId")
 
         val record = applications[instanceId]
+        val archiveProviders = loadProviderInfosFromApk(
+            apkPath = apkPath,
+            packageName = application.packageName,
+            context = virtualContext
+        )
 
         for (providerClassName in providers) {
             // Skip ShizukuProvider — requires INTERACT_ACROSS_USERS_FULL which
@@ -660,16 +693,26 @@ class VirtualApplicationManager @Inject constructor() {
                     ctor.newInstance()
                 } as ContentProvider
 
-                // Build ProviderInfo for attachInfo()
-                val providerInfo = ProviderInfo().apply {
-                    name = providerClassName
-                    authority = providerAuthority.ifEmpty {
+                val archiveInfo = archiveProviders[providerClassName]
+                val resolvedAuthority = archiveInfo?.authority?.split(';')?.firstOrNull()?.trim()
+                    ?: providerAuthority.ifEmpty {
                         "${virtualContext.packageName}.${providerClassName.substringAfterLast(".")}"
                     }
-                    applicationInfo = virtualContext.applicationInfo
-                    exported = false
+
+                // Build ProviderInfo for attachInfo() — copy meta-data from the
+                // guest APK so FileProvider / AndroidX Startup can read paths & initializers.
+                val providerInfo = ProviderInfo().apply {
+                    name = providerClassName
+                    packageName = application.packageName
+                    authority = resolvedAuthority
+                    applicationInfo = archiveInfo?.applicationInfo ?: virtualContext.applicationInfo
+                    exported = archiveInfo?.exported ?: false
                     enabled = true
-                    grantUriPermissions = true
+                    grantUriPermissions = archiveInfo?.grantUriPermissions ?: true
+                    readPermission = archiveInfo?.readPermission
+                    writePermission = archiveInfo?.writePermission
+                    multiprocess = archiveInfo?.multiprocess ?: false
+                    metaData = archiveInfo?.metaData
                 }
 
                 // Call ContentProvider.attachInfo(context, info)
@@ -677,7 +720,10 @@ class VirtualApplicationManager @Inject constructor() {
                 provider.attachInfo(virtualContext, providerInfo)
 
                 record?.contentProviders?.add(provider)
-                Timber.tag(TAG).d("  Provider installed: $providerClassName")
+                Timber.tag(TAG).d(
+                    "  Provider installed: $providerClassName " +
+                        "(authority=$resolvedAuthority, meta=${providerInfo.metaData != null})"
+                )
 
             } catch (e: ClassNotFoundException) {
                 Timber.tag(TAG).w("ContentProvider class not found: $providerClassName (skipping)")
@@ -689,6 +735,94 @@ class VirtualApplicationManager @Inject constructor() {
                 Timber.tag(TAG).e(e, "Failed to install ContentProvider: $providerClassName")
                 // Don't fail the whole app — some providers are optional
             }
+        }
+    }
+
+    /**
+     * Load ProviderInfo (including meta-data) from the guest APK archive.
+     */
+    private fun loadProviderInfosFromApk(
+        apkPath: String?,
+        packageName: String,
+        context: Context
+    ): Map<String, ProviderInfo> {
+        if (apkPath.isNullOrEmpty()) return emptyMap()
+        return try {
+            val flags = PackageManager.GET_PROVIDERS or PackageManager.GET_META_DATA
+            val pkgInfo = context.packageManager.getPackageArchiveInfo(apkPath, flags)
+                ?: return emptyMap()
+            pkgInfo.applicationInfo?.let { ai ->
+                ai.sourceDir = apkPath
+                ai.publicSourceDir = apkPath
+                ai.packageName = packageName
+            }
+            pkgInfo.providers?.associate { pi ->
+                pi.packageName = packageName
+                pi.applicationInfo = pkgInfo.applicationInfo
+                pi.name to pi
+            } ?: emptyMap()
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "loadProviderInfosFromApk failed for $apkPath")
+            emptyMap()
+        }
+    }
+
+    /**
+     * Make the current host stub process look like the guest's main process.
+     *
+     * Spoofs:
+     * - ActivityThread.sCurrentProcessName (Application.getProcessName / Process.myProcessName)
+     * - ActivityThread.mBoundApplication.processName
+     * - ActivityThread.mInitialApplication (+ mAllApplications)
+     */
+    private fun spoofGuestProcessIdentity(packageName: String, application: Application) {
+        try {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val currentAT = atClass.getDeclaredMethod("currentActivityThread").invoke(null)
+            if (currentAT == null) {
+                Timber.tag(TAG).w("spoofGuestProcessIdentity: ActivityThread is null")
+                return
+            }
+
+            // Application.getProcessName() / Process.myProcessName() (API 28+)
+            findField(atClass, "sCurrentProcessName")?.let { field ->
+                field.isAccessible = true
+                field.set(null, packageName)
+                Timber.tag(TAG).d("sCurrentProcessName → $packageName")
+            }
+
+            // Legacy path: mBoundApplication.processName
+            findField(atClass, "mBoundApplication")?.let { field ->
+                field.isAccessible = true
+                val boundApp = field.get(currentAT)
+                if (boundApp != null) {
+                    findField(boundApp.javaClass, "processName")?.let { pnField ->
+                        pnField.isAccessible = true
+                        pnField.set(boundApp, packageName)
+                        Timber.tag(TAG).d("mBoundApplication.processName → $packageName")
+                    }
+                }
+            }
+
+            // Libraries that use ActivityThread.currentApplication()
+            findField(atClass, "mInitialApplication")?.let { field ->
+                field.isAccessible = true
+                field.set(currentAT, application)
+                Timber.tag(TAG).d("mInitialApplication → ${application.javaClass.name}")
+            }
+
+            findField(atClass, "mAllApplications")?.let { field ->
+                field.isAccessible = true
+                @Suppress("UNCHECKED_CAST")
+                val apps = field.get(currentAT) as? MutableList<Application>
+                if (apps != null && !apps.contains(application)) {
+                    apps.add(application)
+                }
+            }
+
+            Timber.tag(TAG).i("Guest process identity spoofed as $packageName")
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "spoofGuestProcessIdentity failed (non-fatal)")
         }
     }
 

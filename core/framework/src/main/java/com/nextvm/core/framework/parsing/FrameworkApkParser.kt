@@ -7,7 +7,9 @@ import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.content.pm.ProviderInfo
 import android.content.pm.ServiceInfo
+import android.content.res.AssetManager
 import android.os.Build
+import org.xmlpull.v1.XmlPullParser
 import timber.log.Timber
 import java.io.File
 import java.util.zip.ZipFile
@@ -37,6 +39,7 @@ class FrameworkApkParser @Inject constructor(
 ) {
     companion object {
         private const val TAG = "FrameworkApkParser"
+        private const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
         const val APK_FILE_EXTENSION = ".apk"
     }
 
@@ -275,7 +278,7 @@ class FrameworkApkParser @Inject constructor(
         pkgInfo.applicationInfo?.sourceDir = apkPath
         pkgInfo.applicationInfo?.publicSourceDir = apkPath
 
-        val mainActivity = findMainLauncherActivity(pkgInfo)
+        val mainActivity = findMainLauncherActivity(pkgInfo, apkPath)
         val nativeAbis = detectNativeAbis(apkPath)
 
         val fullInfo = FullPackageInfo(
@@ -306,10 +309,28 @@ class FrameworkApkParser @Inject constructor(
     }
 
     /**
-     * Find the main launcher activity using intent filter analysis.
-     * Mirrors the real Android intent resolution logic.
+     * Re-resolve the launcher directly from a persisted APK.
+     *
+     * Installed virtual-app records can outlive parser changes, so callers use
+     * this lightweight path to repair an old, heuristically selected launcher.
      */
-    private fun findMainLauncherActivity(pkgInfo: PackageInfo): String? {
+    @Suppress("DEPRECATION")
+    fun findMainLauncherActivity(apkFile: File): String? {
+        if (!apkFile.exists()) return null
+        val pkgInfo = context.packageManager.getPackageArchiveInfo(
+            apkFile.absolutePath,
+            PackageManager.GET_ACTIVITIES
+        ) ?: return parseMainLauncherFromManifest(apkFile.absolutePath)
+        return findMainLauncherActivity(pkgInfo, apkFile.absolutePath)
+    }
+
+    private fun findMainLauncherActivity(pkgInfo: PackageInfo, apkPath: String): String? {
+        // PackageInfo for an archive does not expose intent filters. Read the
+        // binary manifest so MAIN + LAUNCHER is matched exactly. Name-based
+        // guesses can incorrectly choose MainActivity over a privacy/splash
+        // entry activity (for example, GeekTime's LaunchActivity).
+        parseMainLauncherFromManifest(apkPath)?.let { return it }
+
         val pm = context.packageManager
 
         try {
@@ -334,6 +355,127 @@ class FrameworkApkParser @Inject constructor(
 
         // Last resort: first declared activity (resolve aliases)
         return activities.firstOrNull()?.let { it.targetActivity ?: it.name }
+    }
+
+    /**
+     * Parse AndroidManifest.xml from an APK and return the first enabled
+     * activity/activity-alias containing the exact MAIN + LAUNCHER filter.
+     */
+    @Suppress("DiscouragedPrivateApi")
+    private fun parseMainLauncherFromManifest(apkPath: String): String? {
+        var assetManager: AssetManager? = null
+        return try {
+            assetManager = AssetManager::class.java
+                .getDeclaredConstructor()
+                .apply { isAccessible = true }
+                .newInstance()
+
+            val addAssetPath = AssetManager::class.java
+                .getDeclaredMethod("addAssetPath", String::class.java)
+                .apply { isAccessible = true }
+            val cookie = addAssetPath.invoke(assetManager, apkPath) as? Int ?: 0
+            if (cookie == 0) return null
+
+            assetManager.openXmlResourceParser(cookie, "AndroidManifest.xml").use { parser ->
+                var packageName: String? = null
+                var applicationEnabled = true
+                var currentActivity: String? = null
+                var currentActivityEnabled = true
+                var inIntentFilter = false
+                var hasMainAction = false
+                var hasLauncherCategory = false
+
+                var event = parser.eventType
+                while (event != XmlPullParser.END_DOCUMENT) {
+                    when (event) {
+                        XmlPullParser.START_TAG -> when (parser.name) {
+                            "manifest" -> {
+                                packageName = parser.getAttributeValue(null, "package")
+                            }
+                            "application" -> {
+                                applicationEnabled = parser.getAttributeBooleanValue(
+                                    ANDROID_NS,
+                                    "enabled",
+                                    true
+                                )
+                            }
+                            "activity", "activity-alias" -> {
+                                currentActivity = parser.getAttributeValue(ANDROID_NS, "name")
+                                    ?.let { resolveComponentName(packageName, it) }
+                                currentActivityEnabled = parser.getAttributeBooleanValue(
+                                    ANDROID_NS,
+                                    "enabled",
+                                    true
+                                )
+                            }
+                            "intent-filter" -> {
+                                if (currentActivity != null) {
+                                    inIntentFilter = true
+                                    hasMainAction = false
+                                    hasLauncherCategory = false
+                                }
+                            }
+                            "action" -> {
+                                if (inIntentFilter &&
+                                    parser.getAttributeValue(ANDROID_NS, "name") ==
+                                    "android.intent.action.MAIN"
+                                ) {
+                                    hasMainAction = true
+                                }
+                            }
+                            "category" -> {
+                                if (inIntentFilter &&
+                                    parser.getAttributeValue(ANDROID_NS, "name") ==
+                                    "android.intent.category.LAUNCHER"
+                                ) {
+                                    hasLauncherCategory = true
+                                }
+                            }
+                        }
+                        XmlPullParser.END_TAG -> when (parser.name) {
+                            "intent-filter" -> {
+                                if (applicationEnabled && currentActivityEnabled &&
+                                    hasMainAction && hasLauncherCategory
+                                ) {
+                                    val launcher = currentActivity
+                                    if (launcher != null) {
+                                        Timber.tag(TAG).d(
+                                            "Manifest launcher resolved: $launcher"
+                                        )
+                                        return launcher
+                                    }
+                                }
+                                inIntentFilter = false
+                            }
+                            "activity", "activity-alias" -> {
+                                currentActivity = null
+                                inIntentFilter = false
+                            }
+                        }
+                    }
+                    event = parser.next()
+                }
+                null
+            }
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "Failed to parse launcher from $apkPath")
+            null
+        } finally {
+            try {
+                assetManager?.close()
+            } catch (_: Exception) {
+                // Ignore close failures from framework AssetManager.
+            }
+        }
+    }
+
+    private fun resolveComponentName(packageName: String?, name: String): String {
+        if (packageName == null) return name
+        return when {
+            name.startsWith(".") -> "$packageName$name"
+            !name.contains(".") -> "$packageName.$name"
+            else -> name
+        }
     }
 
     /**
